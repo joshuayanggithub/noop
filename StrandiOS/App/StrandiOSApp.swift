@@ -172,7 +172,12 @@ struct StrandiOSApp: App {
         // scenePhase pass below starts the offload and wrote to Health in parallel with it, so a night
         // synced on open only reached Health at the next launch. Weak so the scene owns the bridge's
         // lifetime; the bridge no-ops unless Health was authorized.
+        // #1314: the Experimental self-hosted push uses the same "new data landed" signal. `trigger()`
+        // only starts a separate task (and does nothing while the push is off), so the offload path
+        // never waits on a receiver.
+        SelfHostedPushController.shared.configure(repo: model.repo)
         model.healthWriteBack = { [weak bridge] in
+            SelfHostedPushController.shared.trigger()
             _ = await bridge?.writeBackAfterNewData()
         }
     }
@@ -374,6 +379,8 @@ struct StrandiOSApp: App {
                 // opened, which is a worse regression than the bug being fixed. `analyzeRecent`
                 // serialises itself, so overlapping with the sync this foreground also kicks off is safe.
                 Task { await model.runDeferredRescoreIfOwed() }
+                // #1314: a cheap check on open (one capabilities request, then only changed days).
+                SelfHostedPushController.shared.trigger()
                 Task {
                     health.refreshAuthIfPreviouslyGranted()
                     HealthWritebackBackgroundScheduler.updateSchedule(

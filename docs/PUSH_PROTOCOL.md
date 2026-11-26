@@ -391,3 +391,17 @@ logical v1 streams, but every implementation uses explicit registry projections 
 or `SELECT *`. A platform lacking a nullable exported column emits `null`; platform-only columns stay
 absent until a later negotiated registry version. Scheduling and credential storage are platform
 concerns and do not change NDJSON, acknowledgement, idempotency, or replacement semantics.
+
+The iOS client (More › Self-hosted Push, default off) compiles the four mutable streams only:
+`dailyMetric`, `sleepSession`, `workout` and `journal`. Its effective registry is the intersection
+of those four and the receiver's list, so it sends no append stream even when a receiver advertises
+one. The protocol logic is `SelfHostedPush*.swift` in `Packages/WhoopStore` (covered by
+`SelfHostedPushTests`); the app layer is `StrandiOS/System/SelfHostedPushController.swift`.
+
+- It runs after an offload (the Apple Health write-back hook), on foreground entry, and from
+  **Push now**, as a separate task that the sync path never awaits. It registers no background task.
+- The bearer token is in the Keychain (`AfterFirstUnlockThisDeviceOnly`). Redirects are not followed.
+- Request entities use identity encoding.
+- A `Double` is printed in Swift's shortest round-trip form, and Kotlin uses `Double.toString`. The
+  values are equal, but the decoded bytes, and thus `batchId`, are not byte-identical across the two
+  platforms. A batch ID must be stable only across one sender's own retries.
