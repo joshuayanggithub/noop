@@ -28,6 +28,8 @@ final class SelfHostedPushController: ObservableObject {
 
     private var repo: Repository?
     private var pending = false
+    private var loop: Task<Void, Never>?
+    private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
     private let defaults = UserDefaults.standard
 
     private init() {
@@ -68,13 +70,33 @@ final class SelfHostedPushController: ObservableObject {
     }
 
     /// Start a run if the push is on. A trigger during a run is remembered and starts one more run after it.
+    /// `running` is set here, before the task starts, so two triggers in one moment start one loop.
     func trigger() {
         guard enabled else { return }
         if running {
             pending = true
             return
         }
-        Task { await runLoop() }
+        running = true
+        // A run that starts in the background asks iOS for the usual short extension. When that time
+        // ends, the run is cancelled and the extension is ended, so iOS never has to stop the app for it.
+        backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "noop.selfhostedpush") { [weak self] in
+            // iOS calls this on the main thread and expects the task to end before it returns.
+            MainActor.assumeIsolated { self?.expire() }
+        }
+        loop = Task { await runLoop() }
+    }
+
+    private func expire() {
+        loop?.cancel()
+        endBackgroundTask()
+    }
+
+    private func endBackgroundTask() {
+        if backgroundTask != .invalid {
+            UIApplication.shared.endBackgroundTask(backgroundTask)
+            backgroundTask = .invalid
+        }
     }
 
     /// The capabilities request alone; it reads no health data.
@@ -97,24 +119,22 @@ final class SelfHostedPushController: ObservableObject {
         repeat {
             pending = false
             await runOnce()
-        } while pending && enabled
+        } while pending && enabled && !Task.isCancelled
+        running = false
+        loop = nil
+        endBackgroundTask()
     }
 
     private func runOnce() async {
         guard let repo, let store = await repo.storeHandle() else { return finish("The local store is not open.") }
         guard PushEndpointPolicy.validate(endpointText) != nil else { return finish(Self.endpointHelp) }
         guard let runner = runner() else { return finish("Save a token first.") }
-        running = true
-        // A run that starts in the background asks iOS for the usual short extension, and ends it.
-        let background = UIApplication.shared.beginBackgroundTask(withName: "noop.selfhostedpush") {}
-        defer {
-            running = false
-            if background != .invalid { UIApplication.shared.endBackgroundTask(background) }
-        }
         var progress = loadProgress()
         let report = await runner.run(store: store, progress: &progress)
         saveProgress(progress)
-        if report.ok {
+        if Task.isCancelled {
+            finish("Stopped: iOS ended the background time. The next sync continues from here.")
+        } else if report.ok {
             finish(report.sent.isEmpty ? "Up to date. Nothing changed since the last push."
                                        : "Sent \(report.sent.count) replacement\(report.sent.count == 1 ? "" : "s"); \(report.unchanged) unchanged.")
         } else {

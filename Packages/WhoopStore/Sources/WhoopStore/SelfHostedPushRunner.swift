@@ -93,6 +93,11 @@ public struct SelfHostedPushRunner: Sendable {
         for stream in streams {
             let devices = Set(liveDevices).union(namespace.devices[stream.rawValue] ?? []).sorted()
             for device in devices {
+                // A cancelled run (iOS ended the background time) stops between scopes; progress so far is kept.
+                if Task.isCancelled {
+                    report.failures.append("cancelled")
+                    break
+                }
                 let scope = "\(stream.rawValue)|\(device)"
                 do {
                     let records = try await store.pushRecords(stream: stream, deviceId: device, window: horizon)
