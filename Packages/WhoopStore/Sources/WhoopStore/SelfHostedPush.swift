@@ -1,12 +1,16 @@
 import Foundation
+#if canImport(CryptoKit)
+import CryptoKit
+#endif
 
 // Apple client for the Experimental self-hosted push (docs/PUSH_PROTOCOL.md, issue #1314).
 //
 // Scope of this client: protocol 1.0, the four mutable replace-window streams (dailyMetric,
-// sleepSession, workout, journal). The eight append streams (raw samples) are not compiled in, so
-// the effective registry is the intersection of the receiver's list and these four. That is the
-// rule the protocol already states for any client. Wire format, keys, windows and acknowledgement
-// checks follow the document; this file is pure Foundation so `swift test` covers it with no app.
+// sleepSession, workout, journal) and two append streams (hrSample, rrInterval). The other six
+// append streams (raw waveforms, events, battery) are not compiled in, so the effective registry is
+// the intersection of the receiver's list and these six. That is the rule the protocol already states
+// for any client. Wire format, keys, windows, cursors and acknowledgement checks follow the document;
+// this file is pure Foundation so `swift test` covers it with no app.
 //
 // Known difference from the Kotlin client: a Double is printed with Swift's shortest round-trip
 // form, and Kotlin uses `Double.toString`. Both are valid JSON for the same value, but the decoded
@@ -79,6 +83,66 @@ public enum PushStream: String, CaseIterable, Sendable {
         case .sleepSession, .workout: return .startTs
         }
     }
+}
+
+/// The append streams this client compiles in. Column lists are the registry in PUSH_PROTOCOL.md, in order.
+/// Every column of both is an integer (the RR metadata is nullable).
+public enum PushAppendStream: String, CaseIterable, Sendable {
+    case hrSample, rrInterval
+
+    public var keyColumns: [String] {
+        switch self {
+        case .hrSample: return ["ts"]
+        case .rrInterval: return ["ts", "rrMs", "seq"]
+        }
+    }
+
+    public var dataColumns: [String] {
+        switch self {
+        case .hrSample: return ["bpm"]
+        case .rrInterval: return ["ord", "srcChannel", "tsSuspect"]
+        }
+    }
+
+    /// Data columns that may be JSON null.
+    var nullableColumns: Set<String> {
+        switch self {
+        case .hrSample: return []
+        case .rrInterval: return ["ord", "srcChannel", "tsSuspect"]
+        }
+    }
+}
+
+/// An append highwater: the insertion position (SQLite rowid) of the last accepted row, and the
+/// fingerprint of that row's natural key, so a rewritten database is noticed before the cursor is used.
+public struct PushCursor: Codable, Equatable, Sendable {
+    public let rowId: Int64
+    public let keySha256: String
+    public init(rowId: Int64, keySha256: String) {
+        self.rowId = rowId
+        self.keySha256 = keySha256
+    }
+}
+
+/// One local row of an append stream, with its insertion position.
+public struct PushAppendRow: Equatable, Sendable {
+    public let rowId: Int64
+    public let record: PushRecord
+    public init(rowId: Int64, record: PushRecord) {
+        self.rowId = rowId
+        self.record = record
+    }
+}
+
+/// One bounded append request.
+public struct PushAppendBatch: Equatable, Sendable {
+    public let batchId: String
+    public let stream: PushAppendStream
+    public let deviceId: String
+    public let recordCount: Int
+    public let startCursor: PushCursor?
+    public let endCursor: PushCursor
+    public let body: Data
 }
 
 /// A half-open window of whole local days: `fromDay` … `toDay` inclusive as dates, and the
@@ -218,6 +282,99 @@ public enum PushProtocol {
     /// The encoded size of one record line, for the client memory bound.
     public static func encodedSize(stream: PushStream, record: PushRecord) throws -> Int {
         recordLine(try validated(stream, record)).count
+    }
+
+    // MARK: Append delivery
+
+    /// The cursor fingerprint: SHA-256 of `stream` LF `deviceId` LF the compact natural-key object,
+    /// with its members in registry order (not sorted).
+    public static func cursorKeySha256(stream: PushAppendStream, deviceId: String, key: [String: PushValue]) -> String {
+        var text = "{"
+        for (index, column) in stream.keyColumns.enumerated() {
+            if index > 0 { text += "," }
+            appendQuoted(column, to: &text)
+            text += ":"
+            appendCanonical(json(key[column] ?? .null), to: &text)
+        }
+        text += "}"
+        return SHA256Digest.hex(Data("\(stream.rawValue)\n\(deviceId)\n\(text)".utf8))
+    }
+
+    /// The bounded append requests for `rows` (in insertion order, all after `startCursor`).
+    /// Each request starts where the one before it ends. No rows gives no request.
+    public static func appendBatches(stream: PushAppendStream, sourceId: String, deviceId: String,
+                                     startCursor: PushCursor?, rows: [PushAppendRow]) throws -> [PushAppendBatch] {
+        guard UUID(uuidString: sourceId)?.uuidString.lowercased() == sourceId else {
+            throw PushProtocolError("sourceId must be a lowercase canonical UUID")
+        }
+        var previous = startCursor?.rowId ?? Int64.min
+        for row in rows {
+            guard row.rowId > previous else { throw PushProtocolError("\(stream.rawValue) rows are not in insertion order") }
+            previous = row.rowId
+            try validatedAppend(stream, row.record)
+        }
+        func cursorJSON(_ cursor: PushCursor?) -> Any {
+            guard let cursor else { return NSNull() }
+            return ["rowId": cursor.rowId, "keySha256": cursor.keySha256]
+        }
+        func header(count: Int, start: PushCursor?, end: PushCursor, batchId: String) -> [String: Any] {
+            ["type": "batch", "protocolVersion": version, "batchId": batchId, "sourceId": sourceId, "deviceId": deviceId,
+             "stream": stream.rawValue, "delivery": "append", "recordCount": count,
+             "startCursor": cursorJSON(start), "endCursor": cursorJSON(end)]
+        }
+        let widest = PushCursor(rowId: Int64.max, keySha256: String(repeating: "f", count: 64))
+        let headerRoom = canonicalLine(header(count: maxRecords, start: widest, end: widest, batchId: placeholderUUID)).count
+
+        var out: [PushAppendBatch] = []
+        var start = startCursor
+        var index = 0
+        while index < rows.count {
+            var lines: [Data] = []
+            var bytes = headerRoom
+            var end = index
+            while end < rows.count && lines.count < maxRecords {
+                let line = recordLine(rows[end].record)
+                if headerRoom + line.count > maxBodyBytes {
+                    throw PushProtocolError("one \(stream.rawValue) record exceeds the 4 MiB batch limit")
+                }
+                if bytes + line.count > maxBodyBytes { break }
+                lines.append(line)
+                bytes += line.count
+                end += 1
+            }
+            let last = rows[end - 1]
+            let endCursor = PushCursor(rowId: last.rowId,
+                                       keySha256: cursorKeySha256(stream: stream, deviceId: deviceId, key: last.record.key))
+            var identity = header(count: lines.count, start: start, end: endCursor, batchId: "")
+            identity.removeValue(forKey: "batchId")
+            let batchId = stableUUID(identity, lines)
+            var body = canonicalLine(header(count: lines.count, start: start, end: endCursor, batchId: batchId))
+            lines.forEach { body.append($0) }
+            out.append(PushAppendBatch(batchId: batchId, stream: stream, deviceId: deviceId, recordCount: lines.count,
+                                       startCursor: start, endCursor: endCursor, body: body))
+            start = endCursor
+            index = end
+        }
+        return out
+    }
+
+    @discardableResult
+    static func validatedAppend(_ stream: PushAppendStream, _ record: PushRecord) throws -> PushRecord {
+        guard Set(record.key.keys) == Set(stream.keyColumns), record.key.count == stream.keyColumns.count,
+              Set(record.data.keys) == Set(stream.dataColumns), record.data.count == stream.dataColumns.count else {
+            throw PushProtocolError("\(stream.rawValue) record does not match the registry")
+        }
+        for column in stream.keyColumns {
+            guard case .int = record.key[column]! else { throw PushProtocolError("\(stream.rawValue).\(column) is not an integer") }
+        }
+        for column in stream.dataColumns {
+            switch record.data[column]! {
+            case .int: continue
+            case .null where stream.nullableColumns.contains(column): continue
+            default: throw PushProtocolError("\(stream.rawValue).\(column) is not an integer")
+            }
+        }
+        return record
     }
 
     // MARK: Encoding
@@ -383,6 +540,25 @@ public enum PushAck {
         return true
     }
 
+    /// The acknowledgement of one append batch: as `matches`, and `endCursor` must be the request's.
+    public static func matches(_ data: Data, appendBatch batch: PushAppendBatch) -> Bool {
+        guard data.count <= PushProtocol.maxResponseBytes,
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
+        guard Set(object.keys).isDisjoint(with: PushProtocol.forbiddenResponseMembers) else { return false }
+        guard object["protocolVersion"] as? String == PushProtocol.version,
+              object["batchId"] as? String == batch.batchId,
+              object["stream"] as? String == batch.stream.rawValue,
+              object["deviceId"] as? String == batch.deviceId,
+              object["status"] as? String == "accepted",
+              let cursor = object["endCursor"] as? [String: Any], cursor.count == 2,
+              let rowId = cursor["rowId"] as? NSNumber, String(cString: rowId.objCType) != "c",
+              rowId.int64Value == batch.endCursor.rowId, rowId.doubleValue == Double(batch.endCursor.rowId),
+              cursor["keySha256"] as? String == batch.endCursor.keySha256 else { return false }
+        guard let rows = object["acceptedRows"] as? NSNumber, String(cString: rows.objCType) != "c",
+              rows.doubleValue == Double(batch.recordCount) else { return false }
+        return true
+    }
+
     /// The validated `code` of an error body, or nil.
     public static func errorCode(_ data: Data) -> String? {
         guard data.count <= PushProtocol.maxResponseBytes,
@@ -442,11 +618,20 @@ public enum PushEndpointPolicy {
 
 // MARK: SHA-256
 
-/// FIPS 180-4 SHA-256 in plain Swift, so this package keeps building where CryptoKit is absent.
+/// FIPS 180-4 SHA-256. CryptoKit where it exists (fast; the append streams hash about 0.5 MB for each
+/// request), and plain Swift elsewhere, so this package keeps building where CryptoKit is absent.
 public enum SHA256Digest {
     public static func hex(_ data: Data) -> String { hash(data).map { String(format: "%02x", $0) }.joined() }
 
     public static func hash(_ data: Data) -> [UInt8] {
+        #if canImport(CryptoKit)
+        return Array(CryptoKit.SHA256.hash(data: data))
+        #else
+        return portableHash(data)
+        #endif
+    }
+
+    static func portableHash(_ data: Data) -> [UInt8] {
         var h: [UInt32] = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19]
         var message = [UInt8](data)
         let bitLength = UInt64(message.count) * 8

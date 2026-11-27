@@ -14,6 +14,17 @@ public struct PushProgress: Codable, Equatable, Sendable {
     public struct Namespace: Codable, Equatable, Sendable {
         public var dayHashes: [String: [String: String]] = [:]   // "stream|device" → day → hash
         public var devices: [String: [String]] = [:]             // stream → device ids
+        public var cursors: [String: PushCursor] = [:]           // "appendStream|device" → highwater
+
+        public init() {}
+
+        // Progress saved by a version without append streams has no "cursors": read it as empty.
+        public init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            dayHashes = try container.decodeIfPresent([String: [String: String]].self, forKey: .dayHashes) ?? [:]
+            devices = try container.decodeIfPresent([String: [String]].self, forKey: .devices) ?? [:]
+            cursors = try container.decodeIfPresent([String: PushCursor].self, forKey: .cursors) ?? [:]
+        }
     }
     public var namespaces: [String: Namespace] = [:]
     public init() {}
@@ -23,16 +34,22 @@ public struct PushProgress: Codable, Equatable, Sendable {
 public struct PushRunReport: Equatable, Sendable {
     public var receiverStreams: [String] = []
     public var sent: [String] = []          // "dailyMetric my-whoop 2026-11-20…2026-11-25 (6 rows)"
+    public var appendedRows = 0             // new hrSample and rrInterval rows accepted in this run
+    public var appendPending = false        // an append stream stopped at the per-run cap; the next run continues
     public var unchanged = 0
     public var failures: [String] = []
     public var ok: Bool { failures.isEmpty }
 }
 
-/// One push attempt over the four mutable streams (see SelfHostedPush.swift for the scope).
+/// One push attempt over the four mutable streams, then the two append streams (see SelfHostedPush.swift
+/// for the scope).
 /// Network or receiver failure never touches local data: progress moves only after an exact
 /// acknowledgement of every part of a replacement.
 public struct SelfHostedPushRunner: Sendable {
     public static let horizonDays = 14
+    /// At most this many append requests for one (stream, device) in one run (2 million rows at most).
+    /// A larger backlog continues on the next run, from the saved cursor.
+    public static let maxAppendBatchesPerRun = 400
     public let endpoint: URL
     public let token: String
     public let sourceId: String
@@ -72,7 +89,8 @@ public struct SelfHostedPushRunner: Sendable {
         }
         report.receiverStreams = capabilities.streams.sorted()
         let streams = PushStream.allCases.filter { capabilities.streams.contains($0.rawValue) }
-        if streams.isEmpty { return report }
+        let appendStreams = PushAppendStream.allCases.filter { capabilities.streams.contains($0.rawValue) }
+        if streams.isEmpty && appendStreams.isEmpty { return report }
         let namespaceKey = SHA256Digest.hex(Data([sourceId, PushEndpointPolicy.normalized(endpoint),
                                                   capabilities.protocolVersion, capabilities.receiverStateId]
             .joined(separator: "\n").utf8))
@@ -85,7 +103,7 @@ public struct SelfHostedPushRunner: Sendable {
 
         let liveDevices: [String]
         do {
-            liveDevices = try await store.pushDeviceIds(streams: streams)
+            liveDevices = streams.isEmpty ? [] : try await store.pushDeviceIds(streams: streams)
         } catch {
             report.failures.append("device list: \(error)")
             return report
@@ -129,8 +147,76 @@ public struct SelfHostedPushRunner: Sendable {
                 }
             }
         }
+        // The append streams come after the day numbers, so a long backlog never delays them.
+        for stream in appendStreams where !Task.isCancelled {
+            await pushAppend(stream: stream, store: store, since: horizon.startTsInclusive, namespace: &namespace,
+                             save: { progress.namespaces[namespaceKey] = $0 }, report: &report)
+        }
         if namespace != PushProgress.Namespace() { progress.namespaces[namespaceKey] = namespace }
         return report
+    }
+
+    /// Sends the new rows of one append stream, device by device, from each saved cursor. A device with
+    /// no cursor starts at the first row of the horizon. The cursor moves only after an exact
+    /// acknowledgement, and it is saved after each request, so a stopped run loses no progress.
+    func pushAppend(stream: PushAppendStream, store: WhoopStore, since: Int64, namespace: inout PushProgress.Namespace,
+                    save: (PushProgress.Namespace) -> Void, report: inout PushRunReport) async {
+        let devices: [String]
+        do {
+            devices = Set(try await store.pushAppendDeviceIds(stream: stream))
+                .union(namespace.devices[stream.rawValue] ?? []).sorted()
+        } catch {
+            report.failures.append("\(stream.rawValue) device list: \(error)")
+            return
+        }
+        for device in devices {
+            if Task.isCancelled {
+                report.failures.append("cancelled")
+                return
+            }
+            let scope = "\(stream.rawValue)|\(device)"
+            do {
+                var cursor = namespace.cursors[scope]
+                if let saved = cursor, !(try await store.pushAppendCursorIsValid(stream: stream, deviceId: device, cursor: saved)) {
+                    cursor = nil
+                    namespace.cursors[scope] = nil
+                }
+                var after: Int64
+                if let cursor {
+                    after = cursor.rowId
+                } else if let floor = try await store.pushAppendFloor(stream: stream, deviceId: device, sinceTs: since) {
+                    after = floor
+                } else {
+                    continue
+                }
+                var requests = 0, rows = 0
+                while requests < Self.maxAppendBatchesPerRun {
+                    if Task.isCancelled { break }
+                    let page = try await store.pushAppendRows(stream: stream, deviceId: device, afterRowId: after,
+                                                              limit: PushProtocol.maxRecords)
+                    if page.isEmpty { break }
+                    let batches = try PushProtocol.appendBatches(stream: stream, sourceId: sourceId, deviceId: device,
+                                                                 startCursor: cursor, rows: page)
+                    for batch in batches where requests < Self.maxAppendBatchesPerRun {
+                        try await post(batch)
+                        cursor = batch.endCursor
+                        after = batch.endCursor.rowId
+                        namespace.cursors[scope] = batch.endCursor
+                        var known = Set(namespace.devices[stream.rawValue] ?? [])
+                        if known.insert(device).inserted { namespace.devices[stream.rawValue] = known.sorted() }
+                        save(namespace)
+                        requests += 1
+                        rows += batch.recordCount
+                        report.appendedRows += batch.recordCount
+                    }
+                    if page.count < PushProtocol.maxRecords && after == page.last?.rowId { break }
+                }
+                if requests >= Self.maxAppendBatchesPerRun { report.appendPending = true }
+                if rows > 0 { report.sent.append("\(stream.rawValue) \(device) (\(rows) new rows)") }
+            } catch {
+                report.failures.append("\(scope): \(error)")
+            }
+        }
     }
 
     func dayName(of record: PushRecord, _ stream: PushStream) -> String {
@@ -147,19 +233,32 @@ public struct SelfHostedPushRunner: Sendable {
     }
 
     func post(_ batch: PushBatch) async throws {
+        let body = try await send(batch.body)
+        guard PushAck.matches(body, batch: batch) else {
+            throw PushProtocolError("the receiver's acknowledgement does not match the batch")
+        }
+    }
+
+    func post(_ batch: PushAppendBatch) async throws {
+        let body = try await send(batch.body)
+        guard PushAck.matches(body, appendBatch: batch) else {
+            throw PushProtocolError("the receiver's acknowledgement does not match the batch")
+        }
+    }
+
+    /// One batch POST. Returns the response body of a 2xx response.
+    func send(_ entity: Data) async throws -> Data {
         var request = URLRequest(url: endpoint, timeoutInterval: 30)
         request.httpMethod = "POST"
         request.setValue("application/x-ndjson; charset=utf-8", forHTTPHeaderField: "Content-Type")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        request.httpBody = batch.body
+        request.httpBody = entity
         let (status, body) = try await transport.send(request)
         guard (200..<300).contains(status) else {
             throw PushProtocolError("HTTP \(status)" + (PushAck.errorCode(body).map { " \($0)" } ?? ""))
         }
-        guard PushAck.matches(body, batch: batch) else {
-            throw PushProtocolError("the receiver's acknowledgement does not match the batch")
-        }
+        return body
     }
 }
 

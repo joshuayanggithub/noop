@@ -105,8 +105,8 @@ final class SelfHostedPushController: ObservableObject {
         guard let runner = runner() else { return "Save a token first." }
         do {
             let caps = try await runner.capabilities()
-            let usable = PushStream.allCases.map(\.rawValue).filter(caps.streams.contains)
-            return usable.isEmpty ? "Connected, but the receiver accepts none of NOOP's daily streams."
+            let usable = (PushStream.allCases.map(\.rawValue) + PushAppendStream.allCases.map(\.rawValue)).filter(caps.streams.contains)
+            return usable.isEmpty ? "Connected, but the receiver accepts none of NOOP's streams."
                                   : "Connected. The receiver accepts: \(usable.joined(separator: ", "))."
         } catch {
             return "Connection failed: \(error)"
@@ -135,8 +135,13 @@ final class SelfHostedPushController: ObservableObject {
         if Task.isCancelled {
             finish("Stopped: iOS ended the background time. The next sync continues from here.")
         } else if report.ok {
-            finish(report.sent.isEmpty ? "Up to date. Nothing changed since the last push."
-                                       : "Sent \(report.sent.count) replacement\(report.sent.count == 1 ? "" : "s"); \(report.unchanged) unchanged.")
+            let replacements = report.sent.count - report.sent.filter { $0.hasSuffix("new rows)") }.count
+            var parts: [String] = []
+            if replacements > 0 { parts.append("\(replacements) day replacement\(replacements == 1 ? "" : "s")") }
+            if report.appendedRows > 0 { parts.append("\(report.appendedRows) heart-rate and R-R rows") }
+            let more = report.appendPending ? " More rows wait; the next push continues." : ""
+            finish(parts.isEmpty ? "Up to date. Nothing changed since the last push."
+                                 : "Sent " + parts.joined(separator: " and ") + "; \(report.unchanged) unchanged." + more)
         } else {
             finish("Failed: " + report.failures.prefix(3).joined(separator: "; "))
         }

@@ -21,6 +21,10 @@ final class SelfHostedPushTests: XCTestCase {
                        "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1")
         XCTAssertEqual(SHA256Digest.hex(Data(repeating: 0x61, count: 1_000)),
                        "41edece42d63e8d9bf515a9ba6932e1c20cbc9f5a5d134645adb5db1b9737ea3")
+        // The plain-Swift path (used where CryptoKit is absent) gives the same digests.
+        for input in [Data(), Data("abc".utf8), Data(repeating: 0x61, count: 1_000), Data((0..<200).map { UInt8($0) })] {
+            XCTAssertEqual(SHA256Digest.portableHash(input), SHA256Digest.hash(input))
+        }
     }
 
     // MARK: - Encoding
@@ -226,7 +230,7 @@ final class SelfHostedPushTests: XCTestCase {
             bodies.append(body)
             let header = try JSONSerialization.jsonObject(with: body.prefix { $0 != 0x0a }) as! [String: Any]
             let ack: [String: Any] = ["protocolVersion": "1.0", "batchId": header["batchId"]!, "stream": header["stream"]!,
-                                      "deviceId": header["deviceId"]!, "endCursor": NSNull(),
+                                      "deviceId": header["deviceId"]!, "endCursor": header["endCursor"] ?? NSNull(),
                                       "acceptedRows": badAck ? 0 : header["recordCount"]!, "status": "accepted"]
             return (200, try JSONSerialization.data(withJSONObject: ack))
         }
@@ -307,12 +311,114 @@ final class SelfHostedPushTests: XCTestCase {
             try db.execute(sql: "INSERT INTO dailyMetric (deviceId, day, totalSleepMin) VALUES ('my-whoop-noop', '2026-11-24', 400)")
         }
         let receiver = FakeReceiver()
-        receiver.streams = ["hrSample"]
+        receiver.streams = ["gravitySample"]
         let runner = SelfHostedPushRunner(endpoint: URL(string: "https://receiver.example/noop")!, token: "t",
                                           sourceId: Self.source, transport: receiver, calendar: utc)
         var progress = PushProgress()
         let report = await runner.run(store: store, progress: &progress)
         XCTAssertTrue(report.ok)
         XCTAssertTrue(receiver.bodies.isEmpty)
+    }
+
+    // MARK: - Append streams
+
+    func hrRow(_ rowId: Int64, ts: Int64, bpm: Int64) -> PushAppendRow {
+        PushAppendRow(rowId: rowId, record: PushRecord(key: ["ts": .int(ts)], data: ["bpm": .int(bpm)]))
+    }
+
+    func testAppendBatchesCarryChainedCursors() throws {
+        let rows = (1...5_001).map { hrRow(Int64($0) + 100, ts: 1_795_132_800 + Int64($0), bpm: 60) }
+        let batches = try PushProtocol.appendBatches(stream: .hrSample, sourceId: Self.source, deviceId: "my-whoop",
+                                                     startCursor: nil, rows: rows)
+        XCTAssertEqual(batches.map(\.recordCount), [5_000, 1])
+        XCTAssertNil(batches[0].startCursor)
+        XCTAssertEqual(batches[1].startCursor, batches[0].endCursor)
+        XCTAssertEqual(batches[0].endCursor.rowId, 5_100)
+        XCTAssertEqual(batches[1].endCursor.rowId, 5_101)
+        let header = try JSONSerialization.jsonObject(with: batches[1].body.prefix { $0 != 0x0a }) as! [String: Any]
+        XCTAssertEqual(header["delivery"] as? String, "append")
+        XCTAssertNil(header["window"])
+        XCTAssertEqual((header["startCursor"] as! [String: Any])["rowId"] as? Int, 5_100)
+        XCTAssertEqual((header["endCursor"] as! [String: Any])["keySha256"] as? String, batches[1].endCursor.keySha256)
+        // The fingerprint is over stream LF device LF the key in registry order (ts, rrMs, seq), not sorted.
+        XCTAssertEqual(PushProtocol.cursorKeySha256(stream: .rrInterval, deviceId: "d", key: ["seq": .int(0), "ts": .int(5), "rrMs": .int(800)]),
+                       SHA256Digest.hex(Data("rrInterval\nd\n{\"ts\":5,\"rrMs\":800,\"seq\":0}".utf8)))
+        let again = try PushProtocol.appendBatches(stream: .hrSample, sourceId: Self.source, deviceId: "my-whoop",
+                                                   startCursor: nil, rows: rows)
+        XCTAssertEqual(again, batches, "a retry repeats the identical entity")
+        // Out of insertion order, a null bpm, or a missing column fails before anything is encoded.
+        XCTAssertThrowsError(try PushProtocol.appendBatches(stream: .hrSample, sourceId: Self.source, deviceId: "d", startCursor: nil,
+                                                            rows: [hrRow(5, ts: 1, bpm: 60), hrRow(4, ts: 2, bpm: 60)]))
+        XCTAssertThrowsError(try PushProtocol.appendBatches(stream: .hrSample, sourceId: Self.source, deviceId: "d", startCursor: nil,
+                                                            rows: [PushAppendRow(rowId: 1, record: PushRecord(key: ["ts": .int(1)], data: ["bpm": .null]))]))
+        XCTAssertNoThrow(try PushProtocol.appendBatches(stream: .rrInterval, sourceId: Self.source, deviceId: "d", startCursor: nil, rows: [
+            PushAppendRow(rowId: 1, record: PushRecord(key: ["ts": .int(1), "rrMs": .int(800), "seq": .int(0)],
+                                                       data: ["ord": .null, "srcChannel": .int(5), "tsSuspect": .null]))]))
+    }
+
+    func testAppendAcknowledgementMustEchoTheEndCursor() throws {
+        let batch = try PushProtocol.appendBatches(stream: .hrSample, sourceId: Self.source, deviceId: "my-whoop", startCursor: nil,
+                                                   rows: [hrRow(7, ts: 1_795_132_800, bpm: 61)])[0]
+        func ack(_ change: (inout [String: Any]) -> Void = { _ in }) -> Data {
+            var object: [String: Any] = ["protocolVersion": "1.0", "batchId": batch.batchId, "stream": "hrSample", "deviceId": "my-whoop",
+                                         "endCursor": ["rowId": 7, "keySha256": batch.endCursor.keySha256], "acceptedRows": 1, "status": "accepted"]
+            change(&object)
+            return try! JSONSerialization.data(withJSONObject: object)
+        }
+        XCTAssertTrue(PushAck.matches(ack(), appendBatch: batch))
+        XCTAssertFalse(PushAck.matches(ack { $0["endCursor"] = NSNull() }, appendBatch: batch))
+        XCTAssertFalse(PushAck.matches(ack { $0["endCursor"] = ["rowId": 8, "keySha256": batch.endCursor.keySha256] }, appendBatch: batch))
+        XCTAssertFalse(PushAck.matches(ack { $0["endCursor"] = ["rowId": 7, "keySha256": String(repeating: "a", count: 64)] }, appendBatch: batch))
+        XCTAssertFalse(PushAck.matches(ack { $0["acceptedRows"] = 2 }, appendBatch: batch))
+    }
+
+    func testRunSendsTheHorizonOfAppendRowsThenOnlyNewRows() async throws {
+        let store = try await WhoopStore.inMemory()
+        let now = ISO8601DateFormatter().date(from: "2026-11-25T18:00:00Z")!
+        let old = 1_795_132_800 - 30 * 86_400   // before the 14-day horizon
+        let recent = 1_795_132_800              // 2026-11-20, inside it
+        try await store.registryWriter.write { db in
+            try db.execute(sql: "INSERT INTO hrSample (deviceId, ts, bpm) VALUES ('my-whoop', ?, 70)", arguments: [old])
+            for i in 0..<3 { try db.execute(sql: "INSERT INTO hrSample (deviceId, ts, bpm) VALUES ('my-whoop', ?, ?)", arguments: [recent + i, 60 + i]) }
+            try db.execute(sql: "INSERT INTO rrInterval (deviceId, ts, rrMs, seq, srcChannel) VALUES ('my-whoop', ?, 1000, 0, 5)", arguments: [recent])
+        }
+        let receiver = FakeReceiver()
+        receiver.streams = ["hrSample", "rrInterval"]
+        let runner = SelfHostedPushRunner(endpoint: URL(string: "https://receiver.example/noop")!, token: "t",
+                                          sourceId: Self.source, transport: receiver, calendar: utc)
+        var progress = PushProgress()
+        var report = await runner.run(store: store, progress: &progress, now: now)
+        XCTAssertTrue(report.ok, "\(report.failures)")
+        XCTAssertEqual(receiver.headers().map { $0["stream"] as? String }, ["hrSample", "rrInterval"])
+        XCTAssertEqual(receiver.headers().map { $0["recordCount"] as? Int }, [3, 1], "the row before the horizon is not sent")
+        XCTAssertEqual(report.appendedRows, 4)
+        let firstBody = String(decoding: receiver.bodies[1], as: UTF8.self)
+        XCTAssertTrue(firstBody.contains(#""data":{"ord":null,"srcChannel":5,"tsSuspect":null}"#), firstBody)
+
+        report = await runner.run(store: store, progress: &progress, now: now)
+        XCTAssertEqual(receiver.bodies.count, 2, "nothing new, nothing sent")
+
+        // A later offload can insert an old time: insertion order, not time, decides what is new.
+        try await store.registryWriter.write { db in
+            try db.execute(sql: "INSERT INTO hrSample (deviceId, ts, bpm) VALUES ('my-whoop', ?, 55)", arguments: [recent - 600])
+        }
+        report = await runner.run(store: store, progress: &progress, now: now)
+        XCTAssertEqual(receiver.headers().last?["recordCount"] as? Int, 1)
+        XCTAssertNotNil(receiver.headers().last?["startCursor"] as? [String: Any])
+
+        // The row of the cursor is gone (a prune or a restore): the stream starts again at the horizon.
+        try await store.registryWriter.write { db in
+            try db.execute(sql: "DELETE FROM hrSample WHERE ts = ?", arguments: [recent - 600])
+        }
+        report = await runner.run(store: store, progress: &progress, now: now)
+        XCTAssertTrue(report.ok)
+        XCTAssertEqual(receiver.headers().last?["recordCount"] as? Int, 3)
+        XCTAssertTrue(receiver.headers().last?["startCursor"] is NSNull)
+
+        // Progress saved by the version before append streams still decodes.
+        let older = #"{"namespaces":{"k":{"dayHashes":{},"devices":{"dailyMetric":["my-whoop"]}}}}"#
+        let decoded = try JSONDecoder().decode(PushProgress.self, from: Data(older.utf8))
+        XCTAssertEqual(decoded.namespaces["k"]?.devices["dailyMetric"], ["my-whoop"])
+        XCTAssertEqual(decoded.namespaces["k"]?.cursors, [:])
     }
 }

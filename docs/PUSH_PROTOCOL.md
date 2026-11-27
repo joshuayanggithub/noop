@@ -392,11 +392,20 @@ or `SELECT *`. A platform lacking a nullable exported column emits `null`; platf
 absent until a later negotiated registry version. Scheduling and credential storage are platform
 concerns and do not change NDJSON, acknowledgement, idempotency, or replacement semantics.
 
-The iOS client (More › Self-hosted Push, default off) compiles the four mutable streams only:
-`dailyMetric`, `sleepSession`, `workout` and `journal`. Its effective registry is the intersection
-of those four and the receiver's list, so it sends no append stream even when a receiver advertises
-one. The protocol logic is `SelfHostedPush*.swift` in `Packages/WhoopStore` (covered by
-`SelfHostedPushTests`); the app layer is `StrandiOS/System/SelfHostedPushController.swift`.
+The iOS client (More › Self-hosted Push, default off) compiles six streams: the four mutable
+streams `dailyMetric`, `sleepSession`, `workout` and `journal`, and the append streams `hrSample`
+and `rrInterval`. Its effective registry is the intersection of those six and the receiver's list,
+so it sends no other append stream even when a receiver advertises one. The protocol logic is
+`SelfHostedPush*.swift` in `Packages/WhoopStore` (covered by `SelfHostedPushTests`); the app layer
+is `StrandiOS/System/SelfHostedPushController.swift`.
+
+- Append streams go after the mutable streams in each run. A stream with no cursor starts at the
+  first row (by insertion) whose `ts` is in the 14-day horizon; older rows are not sent. That first
+  batch has `startCursor: null`, as the contract allows.
+- At most 400 append requests for one (stream, device) in one run; the next run continues from the
+  saved cursor. The cursor moves after each acknowledged request, and the app saves it at the end of
+  every run, a cancelled run included. If the app is stopped during a run, the next run repeats
+  those requests with the same batch IDs, and the receiver's upserts make that safe.
 
 - It runs after an offload (the Apple Health write-back hook), on foreground entry, and from
   **Push now**, as a separate task that the sync path never awaits. It registers no background task.
